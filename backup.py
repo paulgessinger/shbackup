@@ -64,6 +64,7 @@ class LFTP:
         cmds = " ".join(map(shlex.quote, cmd))
         self.l.debug(cmds)
 
+        self.proc = pexpect.spawn(cmds)
         try:
             self.l.debug("expecting init")
             self.proc.expect("Password:")
@@ -327,6 +328,7 @@ def get_mysql_dump(l, args, task, conn, aes_key, aes_iv, aes):
             plain = str(plain, "utf-8").strip()
         except:
             ll.error("Error decrypting. response was: " + r.text)
+            raise
         l.info("dump obtained")
         return plain
 
