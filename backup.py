@@ -392,7 +392,7 @@ def main():
 
                 dump = get_mysql_dump(ll, args, task, conn, aes_key, aes_iv, aes)
                 mysql_dump_filename = os.path.join(sql_dir, "{}_mysql_{}.sql.gz".format(task["name"], datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
-                with gzip.open(mysql_dump_filename, "wt") as f:
+                with gzip.open(mysql_dump_filename, "wt", encoding='utf-8') as f:
                     ll.debug("writing to {}".format(mysql_dump_filename))
                     f.write(dump)
 
