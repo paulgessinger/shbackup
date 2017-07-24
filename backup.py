@@ -27,6 +27,8 @@ import gzip
 from datetime import datetime
 import tarfile
 
+from rotate_backups import RotateBackups, coerce_location
+
 l = logging.getLogger("shbackup")
 ch = logging.StreamHandler()
 ch.setLevel(logging.DEBUG)
@@ -57,11 +59,12 @@ class LFTP:
     def __init__(self, exe, basepath = "/"):
         self.exe = exe
         self.basepath = basepath
-    
-    def connect(self, host, user, pwd, port=None):
+
+    def connect(self, logger, host, user, pwd, port=None):
+        self.l = logger
         cmd = [
             self.exe,
-            "-u", "{},{}".format(user, pwd),
+            "-u", "{}".format(user),
             host,
         ]
         
@@ -70,15 +73,17 @@ class LFTP:
             cmd.append(port)
 
         cmds = " ".join(map(shlex.quote, cmd))
-        l.debug(cmds)
+        self.l.debug(cmds)
 
         # self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.proc = pexpect.spawn(cmds)
         try:
-            l.debug("expecting init")
+            self.l.debug("expecting init")
+            self.proc.expect("Password:")
+            self.proc.sendline(pwd)
             self.proc.expect(self.prompt)
         except:
-            l.critical("FTP connection to {}@{} could not be established".format(user, host))
+            self.l.critical("FTP connection to {}@{} could not be established".format(user, host))
             raise
 
     def ls(self):
@@ -108,7 +113,7 @@ class LFTP:
         assert self.proc
         if type(cmd) == list:
             cmd = shjoin(cmd)
-        l.debug("executing command '{}', timeout: {}s".format(cmd, timeout))
+        self.l.debug("executing command '{}', timeout: {}s".format(cmd, timeout))
         try:
             self.proc.sendline(cmd)
             self.proc.expect(self.prompt, timeout=timeout)
@@ -117,7 +122,7 @@ class LFTP:
             lines = list(map(self._clean, lines))
             return lines[1:]
         except:
-            l.critical("Error executing command '{}'".format(cmd))
+            self.l.critical("Error executing command '{}'".format(cmd))
             raise
 
     def cd(self, d):
@@ -151,7 +156,7 @@ class LFTP:
                 try:
                     self.rm(dest)
                 except:
-                    l.warning("tmpfiles: {} could not be removed".format(dest))
+                    self.l.warning("tmpfiles: {} could not be removed".format(dest))
 
     @contextmanager
     def tmpdir(self, d):
@@ -196,7 +201,7 @@ class LFTP:
         if dest != None:
             cmd.extend(["-o", dest])
 
-        l.info("put {} -> {}".format(srcf, dest if dest else os.path.basename(srcf)))
+        self.l.info("put {} -> {}".format(srcf, dest if dest else os.path.basename(srcf)))
         res = self.ex(cmd)
 
         if f: f.close()
@@ -250,8 +255,36 @@ MYSQL_CONFIG_REDAXO = """
     $REX = array('DB' => array('1')) ;
 
     eval($config_str) ;
-    $config = $REX['DB']['1'] ;
+    $config_rex = $REX['DB']['1'] ;
+    $config = array(
+        "host" => $config_rex["HOST"],
+        "name" => $config_rex["NAME"],
+        "user" => $config_rex["LOGIN"],
+        "pass" => $config_rex["PSW"]
+    );
 """
+
+MYSQL_CONFIG_EXPLICIT = """
+    $config = array(
+        "host" => "{host}",
+        "name" => "{name}",
+        "user" => "{user}",
+        "pass" => "{passw}",
+    );
+"""
+
+MYSQL_CONFIG_WORDPRESS = """
+    include "wp-config.php";
+
+    $config = array(
+        "host" => DB_HOST
+        "name" => DB_NAME,
+        "user" => DB_USER,
+        "pass" => DB_PASSWORD,
+    );
+
+"""
+
 
 MYSQL_DUMP_TEMPLATE = """<?php
 
@@ -267,7 +300,7 @@ $aes->setIV($aes_iv);
 
 try {{
     {mysql_config}
-    $dump = new IMysqldump\Mysqldump('mysql:host='.$config["HOST"].';dbname='.$config["NAME"].'', $config["LOGIN"], $config["PSW"]);
+    $dump = new IMysqldump\Mysqldump('mysql:host='.$config["host"].';dbname='.$config["name"].'', $config["user"], $config["pass"]);
     ob_start();
     $dump->start('php://output');
     $dumps = ob_get_clean();
@@ -285,7 +318,7 @@ try {{
 
 """
 
-def get_mysql_dump(args, task, conn, aes_key, aes_iv, aes):
+def get_mysql_dump(l, args, task, conn, aes_key, aes_iv, aes):
     l.info("getting mysql dump")
 
     docroot = task["remote_docroot"]
@@ -294,7 +327,20 @@ def get_mysql_dump(args, task, conn, aes_key, aes_iv, aes):
     dumpurl = "{}/mysqldump/{}".format(task["public_url"], mysqlfilename)
     
     if task["mysql_config"] == "redaxo":
+        l.debug("using conf mode redaxo")
         mysql_config = MYSQL_CONFIG_REDAXO
+    elif type(task["mysql_config"]) == dict:
+        l.debug("using conf mode explicit")
+        conf = task["mysql_config"]
+        mysql_config = MYSQL_CONFIG_EXPLICIT.format(
+            host=conf["host"],
+            name=conf["name"],
+            user=conf["user"],
+            passw=conf["pass"],
+        )
+    elif task["mysql_config"] == "wordpress":
+        l.debug("using conf mode wordpress")
+        mysql_config = MYSQL_CONFIG_WORDPRESS
     else:
         raise ValueError("Invalid MySQL config mode: {}".format(task["mysql_config"]))
     
@@ -322,6 +368,15 @@ def get_mysql_dump(args, task, conn, aes_key, aes_iv, aes):
         l.info("dump obtained")
         return plain
 
+class LoggerAdapter(logging.LoggerAdapter):
+    def __init__(self, l, name):
+        super().__init__(l, {})
+        self.name = name
+
+    def process(self, msg, kwargs):
+        return "" + self.name + " - " + msg, kwargs
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config-file", "-c", default=os.path.expanduser("~/.shbackup"))
@@ -340,10 +395,14 @@ def main():
         # print(aes_key)
 
         for task in config["tasks"]:
+            # create logger adapter for this iteration
+            # ll = logging.LoggerAdapter(l, {'name': task["name"]})
+            ll = LoggerAdapter(l, task["name"])
             try:
+
                 auth = task["auth"]
-                l.info(task["name"])
-                conn.connect(host = auth["host"], user = auth["user"], pwd = auth["pass"], port = auth["port"] if "port" in auth else None)
+                ll.info(task["name"])
+                conn.connect(ll, host = auth["host"], user = auth["user"], pwd = auth["pass"], port = auth["port"] if "port" in auth else None)
 
                 local_dir = task["local_dir"]
                 remote_dir = task["remote_dir"]
@@ -355,31 +414,41 @@ def main():
                 for d in [sql_dir, current_dir, versions_dir]:
                     os.system("mkdir -p {}".format(d))
 
-                dump = get_mysql_dump(args, task, conn, aes_key, aes_iv, aes)
+                dump = get_mysql_dump(l, args, task, conn, aes_key, aes_iv, aes)
                 mysql_dump_filename = os.path.join(sql_dir, "{}_mysql_{}.sql.gz".format(task["name"], datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
                 # print(mysql_dump_filename)
                 with gzip.open(mysql_dump_filename, "wt") as f:
-                    l.debug("writing to {}".format(mysql_dump_filename))
+                    ll.debug("writing to {}".format(mysql_dump_filename))
                     f.write(dump)
 
 
-                l.info("Syncing remote directory to current cache")
+                ll.info("Syncing remote directory to current cache")
                 exs = task["excludes"] if type(task["excludes"]) == list else []
                 exs.append("mysqldump/")
-                print(exs)
-                with conn.cwd(remote_dir):
-                    conn.mirror("./", current_dir, parallel=int(task["max_conn"]), exclude=exs)
+                # with conn.cwd(remote_dir):
+                    # conn.mirror("./", current_dir, parallel=int(task["max_conn"]), exclude=exs)
 
-                files_version_filename = os.path.join(versions_dir, "{}_files_{}.tar.gz".format(task["name"], datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
-                with tarfile.open(files_version_filename, "w:gz") as tar:
-                    l.debug("writing to {}".format(files_version_filename))
-                    tar.add(current_dir, arcname=os.path.basename(current_dir))
+                # files_version_filename = os.path.join(versions_dir, "{}_files_{}.tar.gz".format(task["name"], datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
+                # with tarfile.open(files_version_filename, "w:gz") as tar:
+                    # ll.debug("writing to {}".format(files_version_filename))
+                    # tar.add(current_dir, arcname=os.path.basename(current_dir))
+                
+                l.info("rotating backups")
+                db_rotator = RotateBackups(task["db_retention"], dry_run=False)
+                dbloc = coerce_location(sql_dir)
+                db_rotator.rotate_backups(dbloc)
+                
+                files_rotator = RotateBackups(task["files_retention"], dry_run=False)
+                filesloc = coerce_location(sql_dir)
+                files_rotator.rotate_backups(filesloc)
+
+
 
 
                 conn.close()
             except:
-                l.error("Error while processing {}. continuing".format(task["name"]))
-                if l.getEffectiveLevel() <= logging.DEBUG:
+                ll.error("Error while processing {}. continuing".format(task["name"]))
+                if ll.getEffectiveLevel() <= logging.DEBUG:
                     raise
             
         l.info("Run completed")

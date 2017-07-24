@@ -3,3 +3,4 @@ shell.py
 pexpect
 requests
 pycrypto
+rotate-backups
