@@ -11,7 +11,6 @@ import yaml
 import logging
 from shell import ex
 import tempfile
-# import subprocess
 import pexpect
 import shlex
 import re
@@ -19,25 +18,15 @@ from contextlib import contextmanager
 from urllib.parse import urlparse
 import uuid
 import requests
-# import rsa
 import base64
 from Crypto.Cipher import AES
 from Crypto import Random
 import gzip
 from datetime import datetime
 import tarfile
-
 from rotate_backups import RotateBackups, coerce_location
 
-l = logging.getLogger("shbackup")
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-ch.setFormatter(formatter)
-l.setLevel(logging.DEBUG)
-l.addHandler(ch)
-
-def get_config(p):
+def get_config(l, p):
     l.debug(p)
     with open(p, "r") as f:
         conf = f.read()
@@ -75,8 +64,6 @@ class LFTP:
         cmds = " ".join(map(shlex.quote, cmd))
         self.l.debug(cmds)
 
-        # self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.proc = pexpect.spawn(cmds)
         try:
             self.l.debug("expecting init")
             self.proc.expect("Password:")
@@ -88,13 +75,11 @@ class LFTP:
 
     def ls(self):
         lines = self.ex("ls")
-        # print(lines)
         lines = [l.split(" ")[-1].strip() for l in lines]
         return lines[:-1]
 
     def exists(self, e):
         lines = self.ls()
-        # print(e, lines)
         return e in lines
 
     def pwd(self):
@@ -189,19 +174,17 @@ class LFTP:
         f = None
         if not os.path.isfile(src):
             f = tempfile.NamedTemporaryFile()
-            # f.open()
             f.write(src.encode())
             f.flush()
             srcf = f.name
         else:
             srcf = src
-        # print(srcf)
         
         cmd = ["put", srcf]
         if dest != None:
             cmd.extend(["-o", dest])
 
-        self.l.info("put {} -> {}".format(srcf, dest if dest else os.path.basename(srcf)))
+        self.l.debug("put {} -> {}".format(srcf, dest if dest else os.path.basename(srcf)))
         res = self.ex(cmd)
 
         if f: f.close()
@@ -212,10 +195,9 @@ class LFTP:
         return self.ex(["rm", f])
 
 
-def check_requirements():
+def check_requirements(l):
     l.debug("checking if lftp is installed")
     which_lftp = ex("which lftp")
-    # print(which_lftp.re())
     if which_lftp.re() != 0:
         l.debug(which_lftp.stdout())
         raise RuntimeError("lftp was not found")
@@ -223,28 +205,6 @@ def check_requirements():
 
     return LFTP(exe=lftp_path)
 
-
-# MYSQL_DUMP_TEMPLATE = """<?php
-# header('Content-Type: charset=utf-8');
-# include 'vendor/autoload.php';
-# use \phpseclib\Crypt\RSA;
-# $pk = <<<PK
-# {pubkey}
-# PK;
-
-# $pk = trim($pk);
-
-# $msg = "HALLO";
-
-
-# $rsa = new RSA();
-# $rsa->loadKey($pk);
-# $rsa->setEncryptionMode(CRYPT_RSA_ENCRYPTION_PKCS1);
-# $ciphertext = base64_encode($rsa->encrypt($msg));
-# //$ciphertext = $rsa->encrypt($msg);
-# echo $ciphertext;
-
-# """
 
 MYSQL_CONFIG_REDAXO = """
     // extract db config
@@ -349,7 +309,6 @@ def get_mysql_dump(l, args, task, conn, aes_key, aes_iv, aes):
             aes_iv=str(base64.b64encode(aes_iv), "utf-8"),
             mysql_config = mysql_config,
             )
-    # print(mysqldumpscript)
 
     conn.mkdir("mysqldump")
     with conn.cwd(docroot+"/mysqldump"):
@@ -363,15 +322,18 @@ def get_mysql_dump(l, args, task, conn, aes_key, aes_iv, aes):
         l.debug(r.text)
         raise RuntimeError("Unable to obtain mysql dump")
     else:
-        plain = aes.decrypt(r.content)
-        plain = str(plain, "utf-8").strip()
+        try:
+            plain = aes.decrypt(r.content)
+            plain = str(plain, "utf-8").strip()
+        except:
+            ll.error("Error decrypting. response was: " + r.text)
         l.info("dump obtained")
         return plain
 
 class LoggerAdapter(logging.LoggerAdapter):
     def __init__(self, l, name):
         super().__init__(l, {})
-        self.name = name
+        self.name = name.upper()
 
     def process(self, msg, kwargs):
         return "" + self.name + " - " + msg, kwargs
@@ -381,22 +343,34 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--config-file", "-c", default=os.path.expanduser("~/.shbackup"))
     p.add_argument("--force-vendor", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--quiet", action="store_true")
 
     args = p.parse_args()
 
+    l = logging.getLogger("shbackup")
+    ch = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    l.addHandler(ch)
+    
+    if args.debug:
+        ch.setLevel(logging.DEBUG)
+        l.setLevel(logging.DEBUG)
+    else:
+        ch.setLevel(logging.INFO)
+        l.setLevel(logging.INFO)
+
     try:
-        config = get_config(args.config_file)
-        conn = check_requirements()
+        config = get_config(l, args.config_file)
+        conn = check_requirements(l)
 
         l.info("Generating temporary AES keys for this run")
         aes_key = os.urandom(16)
         aes_iv = os.urandom(16)
         aes = AES.new(aes_key, AES.MODE_CBC, aes_iv)
-        # print(aes_key)
 
         for task in config["tasks"]:
-            # create logger adapter for this iteration
-            # ll = logging.LoggerAdapter(l, {'name': task["name"]})
             ll = LoggerAdapter(l, task["name"])
             try:
 
@@ -414,9 +388,8 @@ def main():
                 for d in [sql_dir, current_dir, versions_dir]:
                     os.system("mkdir -p {}".format(d))
 
-                dump = get_mysql_dump(l, args, task, conn, aes_key, aes_iv, aes)
+                dump = get_mysql_dump(ll, args, task, conn, aes_key, aes_iv, aes)
                 mysql_dump_filename = os.path.join(sql_dir, "{}_mysql_{}.sql.gz".format(task["name"], datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
-                # print(mysql_dump_filename)
                 with gzip.open(mysql_dump_filename, "wt") as f:
                     ll.debug("writing to {}".format(mysql_dump_filename))
                     f.write(dump)
@@ -425,20 +398,26 @@ def main():
                 ll.info("Syncing remote directory to current cache")
                 exs = task["excludes"] if type(task["excludes"]) == list else []
                 exs.append("mysqldump/")
-                # with conn.cwd(remote_dir):
-                    # conn.mirror("./", current_dir, parallel=int(task["max_conn"]), exclude=exs)
+                with conn.cwd(remote_dir):
+                    conn.mirror("./", current_dir, parallel=int(task["max_conn"]), exclude=exs)
 
-                # files_version_filename = os.path.join(versions_dir, "{}_files_{}.tar.gz".format(task["name"], datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
-                # with tarfile.open(files_version_filename, "w:gz") as tar:
-                    # ll.debug("writing to {}".format(files_version_filename))
-                    # tar.add(current_dir, arcname=os.path.basename(current_dir))
+                files_version_filename = os.path.join(versions_dir, "{}_files_{}.tar.gz".format(task["name"], datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
+                with tarfile.open(files_version_filename, "w:gz") as tar:
+                    ll.debug("writing to {}".format(files_version_filename))
+                    tar.add(current_dir, arcname=os.path.basename(current_dir))
                 
-                l.info("rotating backups")
-                db_rotator = RotateBackups(task["db_retention"], dry_run=False)
+                ll.info("rotating backups")
+                db_retention = config["default_db_retention"] if "default_db_retention" in config else {}
+                db_retention.update(task["db_retention"] if "db_retention" in task else {})
+                ll.debug("db retention: "+repr(db_retention))
+                db_rotator = RotateBackups(db_retention, dry_run=False)
                 dbloc = coerce_location(sql_dir)
                 db_rotator.rotate_backups(dbloc)
                 
-                files_rotator = RotateBackups(task["files_retention"], dry_run=False)
+                files_retention = config["default_files_retention"] if "default_files_retention" in config else {}
+                files_retention.update(task["files_retention"] if "files_retention" in task else {})
+                ll.debug("files retention: "+repr(files_retention))
+                files_rotator = RotateBackups(files_retention, dry_run=False)
                 filesloc = coerce_location(sql_dir)
                 files_rotator.rotate_backups(filesloc)
 
