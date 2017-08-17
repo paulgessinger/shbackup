@@ -657,6 +657,7 @@ def main():
             for t, r in zip(config["tasks"], results):
                 if not r:
                     l.error("Task {} failed".format(t["name"]))
+            sys.exit(1)
 
     except Exception as e:
         l.critical(str(e))
